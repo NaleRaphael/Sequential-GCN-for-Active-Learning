@@ -24,6 +24,8 @@ from load_dataset import load_dataset
 from selection_methods import query_samples
 from config import *
 
+from torch_lr_finder import LRFinder
+import matplotlib.pyplot as plt
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-l","--lambda_loss",type=float, default=1.2, 
@@ -46,6 +48,120 @@ parser.add_argument("-t","--total", type=bool, default=False,
                     help="Training on the entire dataset")
 
 args = parser.parse_args()
+
+
+# Copied from `train_test.py`
+def LossPredLoss(input, target, margin=1.0, reduction='mean'):
+    assert len(input) % 2 == 0, 'the batch size is not even.'
+    assert input.shape == input.flip(0).shape
+
+    input = (input - input.flip(0))[:len(input)//2] # [l_1 - l_2B, l_2 - l_2B-1, ... , l_B - l_B+1], where batch_size = 2B
+    target = (target - target.flip(0))[:len(target)//2]
+    target = target.detach()
+
+    one = 2 * torch.sign(torch.clamp(target, min=0)) - 1 # 1 operation which is defined by the authors
+
+    if reduction == 'mean':
+        loss = torch.sum(torch.clamp(margin - one * input, min=0))
+        loss = loss / input.size(0) # Note that the size of input is already halved
+    elif reduction == 'none':
+        loss = torch.clamp(margin - one * input, min=0)
+    else:
+        NotImplementedError()
+
+    return loss
+
+
+class ModelWrapper(nn.Module):
+    # The following code follows this implementation:
+    # https://github.com/razvancaramalau/Sequential-GCN-for-Active-Learning/blob/a0402725/train_test.py#L54
+    def __init__(self, models, method):
+        super().__init__()
+        self.models = nn.ModuleDict(models)
+        self.method = method
+
+    def forward(self, inputs):
+        scores, _, features = self.models['backbone'](inputs)
+
+        if self.method == 'lloss':
+            # Here we also return `features` since it would be used to calculate
+            # another loss. See also here:
+            # https://github.com/razvancaramalau/Sequential-GCN-for-Active-Learning/blob/a0402725/train_test.py#L82-L86
+            # And since `LRFinder` expects the output of `model.forward()` is a
+            # single object, we pack these outputs as a tuple. See also here:
+            # https://github.com/davidtvs/pytorch-lr-finder/blob/acc5e7ee/torch_lr_finder/lr_finder.py#L377
+            return (scores, features)
+        else:
+            return scores
+
+
+class LossWrapper(nn.Module):
+    def __init__(self, loss_func, models, method):
+        super().__init__()
+        self.loss_func = loss_func
+        self.method = method
+        if self.method == 'lloss' and 'module' not in models:
+            raise ValueError('`models["module"]` is required when specified `method` is `lloss`.')
+        self.models = models
+
+    def forward(self, inputs, labels):
+        # unpack
+        if self.method == 'lloss':
+            scores, features = inputs
+        else:
+            scores = inputs
+
+        target_loss = criterion(scores, labels)
+
+        if self.method == 'lloss':
+            # NOTE: We just ignore this part currently since this wrapper is not used for real training.
+            # if epoch > epoch_loss:
+            #     features[0] = features[0].detach()
+            #     features[1] = features[1].detach()
+            #     features[2] = features[2].detach()
+            #     features[3] = features[3].detach()
+
+            pred_loss = self.models['module'](features)
+            pred_loss = pred_loss.view(pred_loss.size(0))
+            m_module_loss   = LossPredLoss(pred_loss, target_loss, margin=MARGIN)
+            m_backbone_loss = torch.sum(target_loss) / target_loss.size(0)
+            loss            = m_backbone_loss + WEIGHT * m_module_loss
+        else:
+            m_backbone_loss = torch.sum(target_loss) / target_loss.size(0)
+            loss            = m_backbone_loss
+        return loss
+
+
+class OptimizerWrapper(optim.Optimizer):
+    # Since the original implementation using the same configuration for 2 models (backbone and module),
+    # we can adopt this setup to create a single optimizer:
+    # https://pytorch.org/docs/stable/optim.html#per-parameter-options
+    # See also the original implementation:
+    # - optimizer for backbone:
+    # https://github.com/razvancaramalau/Sequential-GCN-for-Active-Learning/blob/a0402725/main.py#L116-L117
+    # - optimizer for module:
+    # https://github.com/razvancaramalau/Sequential-GCN-for-Active-Learning/blob/a0402725/main.py#L123-L124
+    #
+    # However, if we want to use 2 different optimizers at the same time, `LRFinder` does not support
+    # this scenario currently. You might need to consider using other hyperparameter search tools
+    # (e.g., Bayesian optimization, hyperband)
+    def __init__(self, optimizer_dict):
+        optim_args = []
+        for _optim in optimizer_dict.values():
+            optim_args.append(_optim.param_groups[0])
+        defaults = {k: v for k, v in optim_args[0].items() if k != 'params'}
+
+        super().__init__(optim_args, defaults)
+
+        self.optimizer_dict = optimizer_dict
+
+    def step(self, *args, **kwargs):
+        for v in self.optimizer_dict.values():
+            v.step(*args, **kwargs)
+
+    def zero_grad(self, *args, **kwargs):
+        for v in self.optimizer_dict.values():
+            v.zero_grad(*args, **kwargs)
 
 ##
 # Main
@@ -113,19 +229,52 @@ if __name__ == '__main__':
             
             # Loss, criterion and scheduler (re)initialization
             criterion      = nn.CrossEntropyLoss(reduction='none')
+
+            # NOTE: We wrote this part. Setup for optimizer and LR scheduler are separated now
+            # because `LRFinder` have to run before the optimizer being attached with the actual
+            # LR scheduler specified by user.
             optim_backbone = optim.SGD(models['backbone'].parameters(), lr=LR, 
                 momentum=MOMENTUM, weight_decay=WDECAY)
- 
-            sched_backbone = lr_scheduler.MultiStepLR(optim_backbone, milestones=MILESTONES)
             optimizers = {'backbone': optim_backbone}
-            schedulers = {'backbone': sched_backbone}
             if method == 'lloss':
                 optim_module   = optim.SGD(models['module'].parameters(), lr=LR, 
                     momentum=MOMENTUM, weight_decay=WDECAY)
-                sched_module   = lr_scheduler.MultiStepLR(optim_module, milestones=MILESTONES)
                 optimizers = {'backbone': optim_backbone, 'module': optim_module}
+
+            # ----- Code related to LRFinder ----
+            model_wrapper = ModelWrapper(models, method)
+            loss_wrapper = LossWrapper(criterion, models, method)
+            optimizer_wrapper = OptimizerWrapper(optimizers)
+
+            # Manually create an axis and pass it into `LRFinder.plot()` to avoid popping window
+            # of figure blocking the procedure.
+            fig, ax = plt.subplots()
+
+            lr_finder = LRFinder(model_wrapper, optimizer_wrapper, loss_wrapper, device='cuda')
+            lr_finder.range_test(train_loader, end_lr=1, num_iter=100)
+            ax, suggested_lr = lr_finder.plot(ax=ax, skip_start=0, skip_end=0, suggest_lr=True)
+
+            # Uncomment this to save the result figure of range test to file
+            # fig.savefig('lr_loss_history.png')
+
+            # Remember to reset model and optimizer to original state
+            lr_finder.reset()
+
+            # Set suggested LR
+            for name in optimizers:
+                optimizers[name].param_groups[0]['lr'] = suggested_lr
+
+            print('----- Updated optimizers -----')
+            print(optimizers)
+            # ^^^^^ Code related to LRFinder ^^^^^
+
+            # Attach LR scheduler
+            sched_backbone = lr_scheduler.MultiStepLR(optim_backbone, milestones=MILESTONES)
+            schedulers = {'backbone': sched_backbone}
+            if method == 'lloss':
+                sched_module   = lr_scheduler.MultiStepLR(optim_module, milestones=MILESTONES)
                 schedulers = {'backbone': sched_backbone, 'module': sched_module}
-            
+
             # Training and testing
             train(models, method, criterion, optimizers, schedulers, dataloaders, args.no_of_epochs, EPOCHL)
             acc = test(models, EPOCH, method, dataloaders, mode='test')
